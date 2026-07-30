@@ -75,4 +75,39 @@ mod tests {
         ];
         assert_eq!(bitset, expected);
     }
+
+    #[test]
+    fn malformed_bitset_num_bytes_is_unsupported() {
+        use polars_parquet_format::thrift::protocol::TCompactOutputProtocol;
+        use polars_parquet_format::{
+            BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash, BloomFilterHeader,
+            SplitBlockAlgorithm, Uncompressed, XxHash,
+        };
+
+        use super::read::read_from_bytes;
+
+        // A header claiming a 16-byte bitset: shorter than one 32-byte block, so probing it
+        // would index out of bounds if it were accepted.
+        let header = BloomFilterHeader {
+            num_bytes: 16,
+            algorithm: BloomFilterAlgorithm::BLOCK(SplitBlockAlgorithm {}),
+            hash: BloomFilterHash::XXHASH(XxHash {}),
+            compression: BloomFilterCompression::UNCOMPRESSED(Uncompressed {}),
+        };
+        let mut bytes = Vec::new();
+        {
+            let mut protocol = TCompactOutputProtocol::new(&mut bytes);
+            header.write_to_out_protocol(&mut protocol).unwrap();
+        }
+        bytes.extend_from_slice(&[0xFF; 16]);
+
+        // The malformed length is unsupported: cleared bitset, no error.
+        let mut bitset = vec![1, 2, 3];
+        read_from_bytes(&bytes, &mut bitset).unwrap();
+        assert!(bitset.is_empty());
+
+        // The probe consequently reports "might contain" (inconclusive) instead of panicking.
+        let mut bitset = Vec::new();
+        assert!(might_contain_any_hashes(&bytes, &[hash_native(1i64)], &mut bitset).unwrap());
+    }
 }

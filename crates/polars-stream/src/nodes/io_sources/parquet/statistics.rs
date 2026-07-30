@@ -4,6 +4,7 @@ use arrow::array::{Array, MutablePrimitiveArray, PrimitiveArray, StructArray};
 use arrow::bitmap::Bitmap;
 use arrow::pushable::Pushable;
 use polars_async::executor::{self, TaskPriority};
+use polars_config::BloomPruning;
 use polars_core::prelude::*;
 use polars_io::RowIndex;
 use polars_io::predicates::ScanIOPredicate;
@@ -101,12 +102,8 @@ impl StatisticsColumns {
 /// - **Statistics** (`skip_batch_predicate` over min/max/null_count from the footer).
 /// - **Bloom filters** (equality / `is_in` literals probed via `byte_source` range reads).
 ///
-/// **Future — dictionary pruning:** On a fully dictionary-encoded column chunk, the dictionary
-/// page is an exact membership set (no false positives), strictly stronger than a bloom. Prefer
-/// dictionary probing on such chunks and fall back to a bloom filter when one is present.
-/// Probing the dictionary means decoding it and building a lookup set (cost scales with
-/// dictionary size), so dictionary pruning should be cost-based — enabled when the dictionary
-/// is small. Not implemented yet.
+/// **Future:** a fully dictionary-encoded chunk's dictionary page is an exact membership set,
+/// strictly stronger than a bloom; prefer it (cost-gated by dictionary size) once implemented.
 pub(super) async fn calculate_row_group_pred_pushdown_skip_mask(
     args: RowGroupPredPushdownArgs<'_>,
 ) -> PolarsResult<Option<Bitmap>> {
@@ -128,12 +125,21 @@ pub(super) async fn calculate_row_group_pred_pushdown_skip_mask(
     // `use_statistics` gates Parquet *column statistics* (min/max/null_count) only.
     // Bloom filters are separate footer metadata and are not disabled by this flag.
     let has_skip_batch_predicate = use_statistics && predicate.skip_batch_predicate.is_some();
-    let bloom_preds = if polars_config::config().bloom_filter_prune() {
+    let bloom_mode = polars_config::config().bloom_filter_prune();
+    // `Auto` probes local sources only: serial per-row-group probes on high-latency storage
+    // lose to not pruning; `whole`/`blocks` opt cloud sources in explicitly.
+    let bloom_enabled = match bloom_mode {
+        BloomPruning::Off => false,
+        BloomPruning::Auto => !byte_source.is_cloud(),
+        BloomPruning::Whole | BloomPruning::Blocks => true,
+    };
+    let bloom_preds = if bloom_enabled {
         collect_bloom_preds(predicate, projected_arrow_fields.as_ref())
     } else {
         None
     };
     let has_bloom_predicates = bloom_preds.is_some();
+    let bloom_whole_read = bloom_mode == BloomPruning::Whole;
 
     if !has_skip_batch_predicate && !has_bloom_predicates {
         return Ok(None);
@@ -146,16 +152,17 @@ pub(super) async fn calculate_row_group_pred_pushdown_skip_mask(
     let metadata = metadata.clone();
     let live_columns = predicate.live_columns.clone();
     let projected_arrow_fields = projected_arrow_fields.clone();
-    // Cloned into the spawned task for bloom `get_range` calls (same `Arc` as row-group fetch).
-    let byte_source = byte_source.clone();
 
-    // Note: We are spawning here onto the computational async runtime because the caller is being run
-    // on a tokio async thread.
-    let skip_row_group_mask = executor::spawn(TaskPriority::High, async move {
-        let row_groups_slice = &metadata.row_groups[row_group_slice.clone()];
+    // Statistics evaluation is CPU-bound over the in-memory footer, so it runs on the compute
+    // runtime. Bloom probing stays out of this task; see the probe below.
+    let stats_metadata = metadata.clone();
+    let stats_row_group_slice = row_group_slice.clone();
+    let statistics_mask = executor::spawn(TaskPriority::High, async move {
+        let metadata = stats_metadata;
+        let row_groups_slice = &metadata.row_groups[stats_row_group_slice.clone()];
 
         if let Some(ri) = &mut row_index {
-            for md in metadata.row_groups[0..row_group_slice.start].iter() {
+            for md in metadata.row_groups[0..stats_row_group_slice.start].iter() {
                 ri.offset = ri
                     .offset
                     .saturating_add(IdxSize::try_from(md.num_rows()).unwrap_or(IdxSize::MAX));
@@ -212,18 +219,22 @@ pub(super) async fn calculate_row_group_pred_pushdown_skip_mask(
             },
         };
 
-        let bloom_mask = bloom_filter_row_group_skip_mask(
-            row_groups_slice,
-            byte_source,
-            bloom_preds,
-            &statistics_mask,
-        )
-        .await?;
-
-        // Skip if either stats or bloom proved the row group cannot match.
-        PolarsResult::Ok(merge_row_group_skip_masks(statistics_mask, bloom_mask))
+        PolarsResult::Ok(statistics_mask)
     })
     .await?;
+
+    // Bloom probing issues byte-source range reads (object_store/reqwest create tokio timers at
+    // poll time), so it must run on this tokio thread, not the compute executor above.
+    let row_groups_slice = &metadata.row_groups[row_group_slice.clone()];
+    let bloom_mask = bloom_filter_row_group_skip_mask(
+        row_groups_slice,
+        byte_source,
+        bloom_preds,
+        &statistics_mask,
+        bloom_whole_read,
+    )
+    .await?;
+    let skip_row_group_mask = merge_row_group_skip_masks(statistics_mask, bloom_mask);
 
     if verbose {
         eprintln!(

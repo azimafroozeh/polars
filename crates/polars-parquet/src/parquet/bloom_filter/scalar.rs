@@ -15,7 +15,8 @@ pub fn hash_parquet_scalar(scalar: &ParquetScalar) -> Option<u64> {
     use ParquetScalar as S;
     match scalar {
         S::Null => None,
-        S::Boolean(v) => Some(hash_byte([*v as u8])),
+        // BOOLEAN has no defined byte encoding to hash; writers don't emit blooms for it.
+        S::Boolean(_) => None,
         // The following four logical types are stored as physical INT32 in Parquet.
         S::Int8(v) => Some(hash_native(i32::from(*v))),
         S::UInt8(v) => Some(hash_native(i32::from(*v))),
@@ -27,8 +28,8 @@ pub fn hash_parquet_scalar(scalar: &ParquetScalar) -> Option<u64> {
         S::UInt32(v) => Some(hash_byte(v.to_le_bytes())),
         // UInt64 logical type is stored as physical INT64.
         S::UInt64(v) => Some(hash_byte(v.to_le_bytes())),
-        S::Float32(v) => Some(hash_native(*v)),
-        S::Float64(v) => Some(hash_native(*v)),
+        // -0.0 == 0.0 but their stored bit patterns hash differently; probing would wrongly skip.
+        S::Float32(_) | S::Float64(_) => None,
         // String logical type is stored as physical BYTE_ARRAY.
         S::String(v) => Some(hash_byte(v.as_bytes())),
         S::Binary(v) | S::FixedSizeBinary(v) => Some(hash_byte(v)),
@@ -75,7 +76,7 @@ pub fn prefer_block_reads(
     if layout.bitset_num_bytes == 0 || unique_blocks == 0 {
         return false;
     }
-    layout.header_len + unique_blocks * BLOCK_SIZE < bloom_slice_len // This may need further optimization.
+    layout.header_len + unique_blocks * BLOCK_SIZE < bloom_slice_len
 }
 
 /// Probe precomputed hashes against individually loaded blocks.

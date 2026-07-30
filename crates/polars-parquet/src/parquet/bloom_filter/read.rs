@@ -6,17 +6,24 @@ use polars_parquet_format::{
     Uncompressed,
 };
 
+use crate::parquet::bloom_filter::split_block::BLOCK_SIZE;
 use crate::parquet::error::ParquetResult;
 use crate::parquet::metadata::ColumnChunkMetadata;
 
 /// Returns the bitset length if the header is supported, otherwise `None`.
+///
+/// Lengths that are zero or not a multiple of [`BLOCK_SIZE`] are malformed and unsupported.
 fn supported_bitset_num_bytes(header: &BloomFilterHeader) -> ParquetResult<Option<usize>> {
     if header.algorithm != BloomFilterAlgorithm::BLOCK(SplitBlockAlgorithm {})
         || header.compression != BloomFilterCompression::UNCOMPRESSED(Uncompressed {})
     {
         return Ok(None);
     }
-    Ok(Some(header.num_bytes.try_into()?))
+    let num_bytes: usize = header.num_bytes.try_into()?;
+    if num_bytes == 0 || !num_bytes.is_multiple_of(BLOCK_SIZE) {
+        return Ok(None);
+    }
+    Ok(Some(num_bytes))
 }
 
 /// Parsed split-block bloom filter header (Thrift) prefix.
